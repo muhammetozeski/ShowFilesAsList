@@ -25,10 +25,18 @@ sealed class MftFileRecord
 
     /// <summary>
     /// Set when the record carries a $REPARSE_POINT attribute (a junction, a symlink, or a similar redirect).
-    /// A reparse point directory has no children of its own in the MFT: whatever it points to is a separate,
-    /// unrelated part of the tree that <see cref="MftVolumeScanner"/> has to scan the ordinary way instead.
+    /// A reparse point directory has no content of its own — <see cref="MftVolumeScanner"/> lists it as a
+    /// junction instead of scanning into it, the same way <see cref="ShowFilesAsList.DirectoryScanner"/> does.
     /// </summary>
     public required bool HasReparsePoint { get; init; }
+
+    /// <summary>
+    /// The reparse point's target path, when <see cref="HasReparsePoint"/> is set and the target could be read —
+    /// a junction or a symbolic link's substitute name, with the leading <c>\??\</c> NT-namespace prefix removed
+    /// when present. <see langword="null"/> for a reparse tag this reader does not know the layout of, or when
+    /// the $REPARSE_POINT attribute is non-resident (not expected for a directory junction or symlink).
+    /// </summary>
+    public required string? ReparseTargetPath { get; init; }
 
     /// <summary>
     /// Real (logical) size in bytes of the unnamed $DATA attribute, when <see cref="DataSizeFoundLocally"/> is

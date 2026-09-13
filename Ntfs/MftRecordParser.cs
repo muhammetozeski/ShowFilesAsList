@@ -16,6 +16,12 @@ static class MftRecordParser
     const ushort DirectoryFlag = 0x0002;
     const long RecordNumberMask = 0x0000FFFFFFFFFFFF;
 
+    // The two reparse tags with a known PathBuffer layout; everything else (cloud placeholders, deduplication,
+    // WIM backing, AppExecLink, ...) is left with no target rather than risk misreading a different layout.
+    const uint MountPointReparseTag = 0xA0000003;
+    const uint SymbolicLinkReparseTag = 0xA000000C;
+    const string NtNamespacePrefix = @"\??\";
+
     /// <returns><see langword="true"/> when <paramref name="buffer"/> at <paramref name="recordOffset"/> starts with the "FILE" signature.</returns>
     public static bool HasFileSignature(byte[] buffer, int recordOffset) =>
         buffer[recordOffset] == (byte)'F' && buffer[recordOffset + 1] == (byte)'I' && buffer[recordOffset + 2] == (byte)'L' && buffer[recordOffset + 3] == (byte)'E';
@@ -74,6 +80,7 @@ static class MftRecordParser
 
         bool isDirectory = (flags & DirectoryFlag) != 0;
         bool hasReparsePoint = false;
+        string? reparseTargetPath = null;
         long dataSize = 0;
         bool dataSizeFoundLocally = false;
         long? externalDataRecordNumber = null;
@@ -85,6 +92,7 @@ static class MftRecordParser
             if (type == ReparsePointAttributeType)
             {
                 hasReparsePoint = true;
+                reparseTargetPath = TryReadReparseTargetPath(buffer, attributeOffset);
             }
             else if (type == FileNameAttributeType)
             {
@@ -132,12 +140,45 @@ static class MftRecordParser
             RecordNumber = recordNumber,
             IsDirectory = isDirectory,
             HasReparsePoint = hasReparsePoint,
+            ReparseTargetPath = reparseTargetPath,
             DataSize = dataSize,
             DataSizeFoundLocally = dataSizeFoundLocally,
             ExternalDataRecordNumber = dataSizeFoundLocally ? null : externalDataRecordNumber,
             HasUnresolvedNonResidentAttributeList = hasUnresolvedNonResidentAttributeList,
             Names = names,
         };
+    }
+
+    /// <summary>
+    /// Reads the target path out of a resident $REPARSE_POINT attribute's <c>REPARSE_DATA_BUFFER</c> value —
+    /// the substitute name, which is always the full, authoritative target, unlike the print name, which is
+    /// sometimes only a shorter display form.
+    /// </summary>
+    /// <returns>The target path, or <see langword="null"/> for a non-resident attribute or an unrecognized reparse tag.</returns>
+    static string? TryReadReparseTargetPath(byte[] buffer, int attributeOffset)
+    {
+        if (buffer[attributeOffset + 8] != 0) // non-resident: not expected for a directory junction or symlink's small target path
+            return null;
+
+        ushort valueOffset = BitConverter.ToUInt16(buffer, attributeOffset + 20);
+        int valueStart = attributeOffset + valueOffset;
+        uint reparseTag = BitConverter.ToUInt32(buffer, valueStart);
+
+        // Both layouts share the same first four fields; a symbolic link's buffer has one extra 4-byte Flags
+        // field before its path buffer that a mount point's does not.
+        int pathBufferStart = reparseTag switch
+        {
+            MountPointReparseTag => valueStart + 16,
+            SymbolicLinkReparseTag => valueStart + 20,
+            _ => -1,
+        };
+        if (pathBufferStart < 0)
+            return null;
+
+        ushort substituteNameOffset = BitConverter.ToUInt16(buffer, valueStart + 8);
+        ushort substituteNameLength = BitConverter.ToUInt16(buffer, valueStart + 10);
+        string target = System.Text.Encoding.Unicode.GetString(buffer, pathBufferStart + substituteNameOffset, substituteNameLength);
+        return target.StartsWith(NtNamespacePrefix, StringComparison.Ordinal) ? target[NtNamespacePrefix.Length..] : target;
     }
 
     /// <summary>

@@ -35,7 +35,7 @@ same sizes, the same tree — so which one ran does not change what ends up in `
 
 ```json
 {
-  "> notes": "Scanned size: 7.49 GB\nFree space on disk: 120.35 GB\nDisk size: 476.94 GB",
+  "> notes": "Scan time: 1.24 s\nScanned size: 7.49 GB\nFree space on disk: 120.35 GB\nDisk size: 476.94 GB",
   "Videos : 6.20 GB": {
     "holiday.mp4": "4.10 GB",
     "birthday.mp4": "2.10 GB"
@@ -52,7 +52,8 @@ same sizes, the same tree — so which one ran does not change what ends up in `
     "Error: Access to the path 'D:\\Archive\\Locked' is denied.": "D:\\Archive\\Locked"
   },
   "notes.txt": "12.50 KB",
-  "desktop.ini": "282 B"
+  "desktop.ini": "282 B",
+  "Old Photos : junction": "D:\\Archive\\2019-Photos"
 }
 ```
 
@@ -62,10 +63,10 @@ same sizes, the same tree — so which one ran does not change what ends up in `
 - A folder's size includes everything below it. Units are binary (1 KB = 1024 B) and the decimal separator follows the Windows region settings.
 - Hidden and system files are counted.
 - A folder that cannot be read does not stop the scan. It gets an `Error:` entry with the reason and its path.
-- Junctions and symbolic links to folders are followed, so their content is counted where they appear — including
-  when that content is also reachable directly under its real location, which then gets counted in both places.
-  This matches how Windows itself resolves them; it is not specific to this program.
-- The notes at the top show the scanned size and the free and total space of the drive.
+- A junction, a symbolic link, or any other kind of folder redirect is listed as `"name : junction": "target"` and
+  never opened: its target is often reachable under its own, real location elsewhere in the tree too, so counting
+  its content here as well would count it twice.
+- The notes at the top show how long the scan took, the scanned size, and the free and total space of the drive.
 - A progress line shows how much has been counted while the scan runs.
 - Quotes around the entered path are removed, so a path copied with Explorer's **Copy as path** can be pasted as it is.
 - Falling back to the ordinary walk (declined elevation, a non-NTFS drive, network path or removable media) still
@@ -137,7 +138,7 @@ dotnet publish -c Release -r win-x64 -p:IlcUseEnvironmentalTools=true -o publish
 | `DirectoryScanner.cs` | The ordinary walk: reads each folder once through the Windows directory API, several at once when the drive allows it |
 | `StorageMediaDetector.cs` | Finds whether a path's drive is solid-state or spinning, to size `DirectoryScanner`'s parallelism |
 | `NativeStorageApi.cs` | The raw `CreateFile` / `DeviceIoControl` calls `StorageMediaDetector` and the NTFS reader share |
-| `ScannedDirectory.cs` | One scanned folder: files, subfolders, total size and read error — the shared result of either scan strategy |
+| `ScannedDirectory.cs` | One scanned folder: files, subfolders, junctions, total size and read error — the shared result of either scan strategy |
 | `ResultJsonWriter.cs` | Writes the notes and the tree to the JSON file |
 | `SizeTextExtensions.cs` | Turns byte counts into text such as `512 B` or `1.50 GB` |
 | `Ntfs/MftVolumeScanner.cs` | The fast path: builds the same tree as `DirectoryScanner` from one read of the volume's Master File Table |

@@ -12,6 +12,13 @@ sealed class ScannedDirectory(string name)
     public readonly List<(string Name, long Size)> Files = [];
 
     /// <summary>
+    /// Junctions, symbolic links and any other reparse point found in this folder. Their own content is never
+    /// scanned or added to <see cref="Size"/>: a reparse point is a redirect, not real content of its own, and
+    /// its target is often reachable — and then counted — under its real location elsewhere in the tree too.
+    /// </summary>
+    public readonly List<(string Name, string Target)> Junctions = [];
+
+    /// <summary>
     /// Total size in bytes of all files in this folder and in every folder below it.
     /// </summary>
     public long Size;

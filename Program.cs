@@ -49,12 +49,14 @@ static class Program
         }
 
         Console.Title = "Scanning";
+        Stopwatch scanStopwatch = Stopwatch.StartNew();
         ScannedDirectory root = Scan(rootPath);
+        TimeSpan scanDuration = scanStopwatch.Elapsed;
         Console.WriteLine();
 
         try
         {
-            ResultJsonWriter.Write(resultFilePath, rootPath, root);
+            ResultJsonWriter.Write(resultFilePath, rootPath, root, scanDuration);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {

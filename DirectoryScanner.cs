@@ -58,13 +58,23 @@ sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, Action<long>? repo
 
         try
         {
-            FileSystemEnumerable<(string Name, bool IsDirectory, long Length)> entries =
-                new(path, static (ref entry) => (entry.FileName.ToString(), entry.IsDirectory, entry.Length), AllEntries);
+            FileSystemEnumerable<(string Name, bool IsDirectory, long Length, FileAttributes Attributes)> entries =
+                new(path, static (ref entry) => (entry.FileName.ToString(), entry.IsDirectory, entry.Length, entry.Attributes), AllEntries);
 
             List<Task<ScannedDirectory>>? parallelSubdirectories = null;
-            foreach ((string entryName, bool isDirectory, long length) in entries)
+            foreach ((string entryName, bool isDirectory, long length, FileAttributes attributes) in entries)
             {
-                if (isDirectory)
+                if (isDirectory && (attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    // A reparse point (a junction, a symbolic link, or any other kind of redirect) has no content
+                    // of its own; its target is often reachable under its own, real location elsewhere in the
+                    // tree too, so recursing into it here would double whatever it points to.
+                    string target;
+                    try { target = Directory.ResolveLinkTarget(Path.Join(path, entryName), returnFinalTarget: false)?.FullName ?? ""; }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { target = ""; }
+                    directory.Junctions.Add((entryName, target));
+                }
+                else if (isDirectory)
                 {
                     string subdirectoryPath = Path.Join(path, entryName);
                     if (extraWorkerSlots is not null && extraWorkerSlots.Wait(0))

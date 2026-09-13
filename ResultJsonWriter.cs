@@ -5,13 +5,15 @@ namespace ShowFilesAsList;
 
 /// <summary>
 /// Saves a <see cref="ScannedDirectory"/> tree as indented JSON. The root object starts with the "> notes" text;
-/// after it every folder is an object keyed "name : size" and every file is a "name": "size" pair.
-/// Inside each object folders come before files, both ordered from the largest to the smallest.
+/// after it every folder is an object keyed "name : size", every file is a "name": "size" pair, and every
+/// junction is a "name : junction": "target" pair. Inside each object folders come before files before
+/// junctions; folders and files are both ordered from the largest to the smallest.
 /// </summary>
 static class ResultJsonWriter
 {
     const string NotesKey = "> notes";
     const string FolderKeySeparator = " : ";
+    const string JunctionKeySuffix = " : junction";
     const string ErrorKeyPrefix = "Error: ";
     const int FlushThresholdBytes = 1024 * 1024;
 
@@ -25,40 +27,54 @@ static class ResultJsonWriter
     /// <param name="filePath">Path of the JSON file to write.</param>
     /// <param name="rootPath">Full path of the scanned folder, used to look up the disk space of its drive.</param>
     /// <param name="root">The scanned folder whose content becomes the root JSON object.</param>
+    /// <param name="scanDuration">How long the scan itself took, from start to the finished tree — not reading the folder path, not writing this file.</param>
     /// <exception cref="IOException">The file could not be created or written.</exception>
     /// <exception cref="UnauthorizedAccessException">Writing to <paramref name="filePath"/> is not permitted.</exception>
-    public static void Write(string filePath, string rootPath, ScannedDirectory root)
+    public static void Write(string filePath, string rootPath, ScannedDirectory root, TimeSpan scanDuration)
     {
         using FileStream file = File.Create(filePath);
         using Utf8JsonWriter writer = new(file, WriterOptions);
 
         writer.WriteStartObject();
-        writer.WriteString(NotesKey, CreateNotes(rootPath, root.Size));
+        writer.WriteString(NotesKey, CreateNotes(rootPath, root.Size, scanDuration));
         WriteContent(writer, root);
         writer.WriteEndObject();
     }
 
+    extension(TimeSpan duration)
+    {
+        /// <summary>Formats a scan duration as milliseconds under a second, seconds with two decimals under a minute, or whole minutes and seconds beyond that.</summary>
+        string ToScanTimeText() => duration.TotalSeconds switch
+        {
+            < 1 => $"{duration.TotalMilliseconds:F0} ms",
+            < 60 => $"{duration.TotalSeconds:F2} s",
+            _ => $"{(int)duration.TotalMinutes} m {duration.Seconds} s",
+        };
+    }
+
     /// <summary>
-    /// Builds the "> notes" text: the scanned size, then the free space and the total size of the drive holding the folder.
+    /// Builds the "> notes" text: the scan time and the scanned size, then the free space and the total size of the drive holding the folder.
     /// </summary>
     /// <param name="rootPath">Full path of the scanned folder.</param>
     /// <param name="scannedBytes">Total size of the scanned files in bytes.</param>
+    /// <param name="scanDuration">How long the scan took.</param>
     /// <returns>
     /// The notes, one fact per line. When the drive cannot be queried, for example because the path is a network share,
     /// the reason is written in place of the drive lines.
     /// </returns>
-    static string CreateNotes(string rootPath, long scannedBytes)
+    static string CreateNotes(string rootPath, long scannedBytes, TimeSpan scanDuration)
     {
+        string scanTimeLine = $"Scan time: {scanDuration.ToScanTimeText()}";
         string scannedSizeLine = $"Scanned size: {scannedBytes.ToSizeText()}";
 
         try
         {
             DriveInfo drive = new(rootPath);
-            return $"{scannedSizeLine}\nFree space on disk: {drive.TotalFreeSpace.ToSizeText()}\nDisk size: {drive.TotalSize.ToSizeText()}";
+            return $"{scanTimeLine}\n{scannedSizeLine}\nFree space on disk: {drive.TotalFreeSpace.ToSizeText()}\nDisk size: {drive.TotalSize.ToSizeText()}";
         }
         catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException)
         {
-            return $"{scannedSizeLine}\nDisk space is unavailable: {exception.Message}";
+            return $"{scanTimeLine}\n{scannedSizeLine}\nDisk space is unavailable: {exception.Message}";
         }
     }
 
@@ -78,6 +94,9 @@ static class ResultJsonWriter
 
         foreach ((string fileName, long fileSize) in directory.Files.OrderByDescending(static file => file.Size))
             writer.WriteString(fileName, fileSize.ToSizeText());
+
+        foreach ((string junctionName, string target) in directory.Junctions)
+            writer.WriteString($"{junctionName}{JunctionKeySuffix}", target);
 
         if (directory.Error is (string message, string path))
             writer.WriteString($"{ErrorKeyPrefix}{message}", path);
