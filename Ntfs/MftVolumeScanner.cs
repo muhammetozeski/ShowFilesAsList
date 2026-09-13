@@ -6,6 +6,13 @@ namespace ShowFilesAsList.Ntfs;
 
 using ShowFilesAsList; // DirectoryScanner and ScannedDirectory: the fallback path for reparse points, and the shared result type
 
+/// <summary>Everything a whole scan's <see cref="MftVolumeScanner.BuildTree"/> calls share, bundled so passing it down through the recursion is one parameter, not five.</summary>
+sealed record MftScanContext(
+    ConcurrentDictionary<long, MftFileRecord> RecordsByNumber,
+    Dictionary<long, List<(MftFileRecord Record, string Name)>> ChildrenByParent,
+    ConcurrentDictionary<long, long> ExtensionRecordDataSizes,
+    long VolumeSerialNumber);
+
 /// <summary>
 /// Scans a folder tree by reading the whole NTFS Master File Table once instead of opening every folder in it:
 /// a handful of large sequential disk reads and one in-memory pass, versus one small disk operation per folder.
@@ -26,11 +33,12 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
         char driveLetter = char.ToUpperInvariant(Path.GetPathRoot(rootPath) is { Length: > 0 } rootPrefix ? rootPrefix[0] : throw new IOException($"'{rootPath}' has no drive letter"));
         NtfsMasterFileTable masterFileTable = NtfsVolumeAccessor.ReadMasterFileTable(driveLetter);
 
-        (Dictionary<long, MftFileRecord> recordsByNumber, Dictionary<long, long> extensionRecordDataSizes) = ParseAllRecords(masterFileTable);
+        (ConcurrentDictionary<long, MftFileRecord> recordsByNumber, ConcurrentDictionary<long, long> extensionRecordDataSizes) = ParseAllRecords(masterFileTable);
         Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent = BuildChildIndex(recordsByNumber);
 
-        long rootRecordNumber = ResolveRecordNumber(rootPath);
-        ScannedDirectory rootDirectory = BuildTree(rootRecordNumber, rootPath, rootPath, recordsByNumber, childrenByParent, extensionRecordDataSizes, [rootRecordNumber]);
+        (long rootRecordNumber, long volumeSerialNumber) = ResolveRecordNumber(rootPath);
+        MftScanContext context = new(recordsByNumber, childrenByParent, extensionRecordDataSizes, volumeSerialNumber);
+        ScannedDirectory rootDirectory = BuildTree(rootRecordNumber, rootPath, rootPath, context, [rootRecordNumber]);
 
         reportProgress?.Invoke(rootDirectory.Size);
         return rootDirectory;
@@ -40,9 +48,12 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
     /// Parses every record of the table, using all available processors since each record's own bytes are
     /// independent of every other record's. Returns the in-use, non-extension records that represent a file or
     /// folder, plus a lookup of the unnamed $DATA size found in every extension record — the overflow records a
-    /// large or fragmented file's $ATTRIBUTE_LIST can point its real $DATA attribute at.
+    /// large or fragmented file's $ATTRIBUTE_LIST can point its real $DATA attribute at. Both stay as the
+    /// concurrent collections they were built as: the record count runs into the millions on a large drive, and
+    /// nothing downstream writes to them again, so copying them into plain Dictionaries first would only add an
+    /// extra full pass over every entry for no benefit.
     /// </summary>
-    static (Dictionary<long, MftFileRecord> RecordsByNumber, Dictionary<long, long> ExtensionRecordDataSizes) ParseAllRecords(NtfsMasterFileTable masterFileTable)
+    static (ConcurrentDictionary<long, MftFileRecord> RecordsByNumber, ConcurrentDictionary<long, long> ExtensionRecordDataSizes) ParseAllRecords(NtfsMasterFileTable masterFileTable)
     {
         int recordLength = masterFileTable.BytesPerFileRecordSegment;
         int recordCount = masterFileTable.Bytes.Length / recordLength;
@@ -67,22 +78,17 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
                 extensionRecordDataSizes[recordNumber] = extensionDataSize;
         });
 
-        return (new Dictionary<long, MftFileRecord>(records), new Dictionary<long, long>(extensionRecordDataSizes));
+        return (records, extensionRecordDataSizes);
     }
 
     /// <summary>Inverts the record set into a parent record number to (child, name) lookup, ready for a top-down tree walk.</summary>
-    static Dictionary<long, List<(MftFileRecord Record, string Name)>> BuildChildIndex(Dictionary<long, MftFileRecord> recordsByNumber)
+    static Dictionary<long, List<(MftFileRecord Record, string Name)>> BuildChildIndex(ConcurrentDictionary<long, MftFileRecord> recordsByNumber)
     {
-        Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent = [];
+        Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent = new(recordsByNumber.Count);
         foreach (MftFileRecord record in recordsByNumber.Values)
         {
             foreach ((long parentRecordNumber, string name) in record.DistinctParentNames())
             {
-                // The volume root names itself as its own parent — NTFS convention, not a mistake — which would
-                // otherwise make BuildTree recurse into the root forever as "its own child".
-                if (parentRecordNumber == record.RecordNumber)
-                    continue;
-
                 if (!childrenByParent.TryGetValue(parentRecordNumber, out List<(MftFileRecord Record, string Name)>? children))
                     childrenByParent[parentRecordNumber] = children = [];
                 children.Add((record, name));
@@ -93,42 +99,23 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
 
     /// <summary>
     /// Builds one folder of the result tree from the parsed record set, recursing into subfolders. A folder that
-    /// carries a reparse point (a junction or similar redirect) has no children of its own in the MFT — whatever
-    /// it points to is scanned the ordinary way, via <see cref="DirectoryScanner"/>, so the result matches what
-    /// Explorer and the classic scanner both show there.
+    /// carries a reparse point (a junction or similar redirect) has no children of its own in the MFT; what it
+    /// points to is resolved through Windows (the same resolution <see cref="DirectoryScanner"/> gets automatically
+    /// from the directory API) and, when that target turns out to be on this same volume, built from the record set
+    /// already in memory — no extra disk access beyond the one small lookup to resolve the target. A target on a
+    /// different volume, or a reparse point Windows itself cannot resolve, falls back to <see cref="DirectoryScanner"/>
+    /// for that one subtree instead, so the result still matches what Explorer shows there.
     /// </summary>
-    /// <param name="recordNumber">MFT record number of the folder to build.</param>
-    /// <param name="fullPath">Full path of the folder, used to open it directly should <paramref name="recordsByNumber"/> turn out not to have it, or a reparse point need the fallback scanner.</param>
-    /// <param name="displayName">The name stored in the result's <see cref="ScannedDirectory.Name"/>.</param>
-    /// <param name="recordsByNumber">Every parsed record, keyed by its MFT record number.</param>
-    /// <param name="childrenByParent">The lookup <see cref="BuildChildIndex"/> built from <paramref name="recordsByNumber"/>.</param>
-    /// <param name="extensionRecordDataSizes">The lookup <see cref="ParseAllRecords"/> built for file sizes a $ATTRIBUTE_LIST moved out of their base record.</param>
-    /// <param name="ancestorRecordNumbers">
-    /// Every record already being built higher up this same branch, <paramref name="recordNumber"/> included.
-    /// <see cref="BuildChildIndex"/> already removes the one cycle NTFS itself creates (the root naming itself as
-    /// its own parent); this is the safety net against a cycle from anywhere else — corruption, or a case this
-    /// reader has not seen — that would otherwise recurse until the stack overflows.
-    /// </param>
-    static ScannedDirectory BuildTree(long recordNumber, string fullPath, string displayName, Dictionary<long, MftFileRecord> recordsByNumber,
-        Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent, Dictionary<long, long> extensionRecordDataSizes, HashSet<long> ancestorRecordNumbers)
+    static ScannedDirectory BuildTree(long recordNumber, string fullPath, string displayName, MftScanContext context, HashSet<long> ancestorRecordNumbers)
     {
-        if (!recordsByNumber.TryGetValue(recordNumber, out MftFileRecord? record))
+        if (!context.RecordsByNumber.TryGetValue(recordNumber, out MftFileRecord? record))
             return new ScannedDirectory(displayName) { Error = ("This path's record was not found while reading the Master File Table.", fullPath) };
 
         if (record.HasReparsePoint)
-        {
-            // DirectoryScanner.Scan names its result after the path it was given, which is right for an actual scan
-            // root but wrong here: this folder is a child of another one, so it needs the plain child name that the
-            // rest of the tree uses, not the full path this fallback scan happened to start from.
-            ScannedDirectory scanned = new DirectoryScanner().Scan(fullPath);
-            ScannedDirectory renamed = new(displayName) { Size = scanned.Size, Error = scanned.Error };
-            renamed.Subdirectories.AddRange(scanned.Subdirectories);
-            renamed.Files.AddRange(scanned.Files);
-            return renamed;
-        }
+            return BuildReparsePointTree(fullPath, displayName, context, ancestorRecordNumbers);
 
         ScannedDirectory directory = new(displayName);
-        foreach ((MftFileRecord childRecord, string childName) in childrenByParent.GetValueOrDefault(recordNumber, []))
+        foreach ((MftFileRecord childRecord, string childName) in context.ChildrenByParent.GetValueOrDefault(recordNumber, []))
         {
             string childPath = Path.Join(fullPath, childName);
             if (childRecord.IsDirectory)
@@ -139,7 +126,7 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
                     continue;
                 }
 
-                ScannedDirectory subdirectory = BuildTree(childRecord.RecordNumber, childPath, childName, recordsByNumber, childrenByParent, extensionRecordDataSizes, ancestorRecordNumbers);
+                ScannedDirectory subdirectory = BuildTree(childRecord.RecordNumber, childPath, childName, context, ancestorRecordNumbers);
                 ancestorRecordNumbers.Remove(childRecord.RecordNumber);
 
                 directory.Subdirectories.Add(subdirectory);
@@ -147,7 +134,7 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
             }
             else
             {
-                long fileSize = ResolveFileSize(childRecord, childPath, extensionRecordDataSizes);
+                long fileSize = ResolveFileSize(childRecord, childPath, context.ExtensionRecordDataSizes);
                 directory.Files.Add((childName, fileSize));
                 directory.Size += fileSize;
             }
@@ -156,12 +143,45 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
     }
 
     /// <summary>
+    /// Resolves a reparse point's target through Windows and builds its subtree from the in-memory record set when
+    /// the target is on this same volume and not already an ancestor of <paramref name="fullPath"/> (a cycle a
+    /// symlink can create that a plain folder cannot). Anything else — a different volume, a target Windows cannot
+    /// resolve, or such a cycle — falls back to <see cref="DirectoryScanner"/> for this one subtree.
+    /// </summary>
+    static ScannedDirectory BuildReparsePointTree(string fullPath, string displayName, MftScanContext context, HashSet<long> ancestorRecordNumbers)
+    {
+        try
+        {
+            (long targetRecordNumber, long targetVolumeSerialNumber) = ResolveRecordNumber(fullPath);
+            if (targetVolumeSerialNumber == context.VolumeSerialNumber && context.RecordsByNumber.ContainsKey(targetRecordNumber) && ancestorRecordNumbers.Add(targetRecordNumber))
+            {
+                ScannedDirectory resolved = BuildTree(targetRecordNumber, fullPath, displayName, context, ancestorRecordNumbers);
+                ancestorRecordNumbers.Remove(targetRecordNumber);
+                return resolved;
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Windows could not resolve this reparse point either; DirectoryScanner will report the same failure below.
+        }
+
+        // DirectoryScanner.Scan names its result after the path it was given, which is right for an actual scan
+        // root but wrong here: this folder is a child of another one, so it needs the plain child name that the
+        // rest of the tree uses, not the full path this fallback scan happened to start from.
+        ScannedDirectory scanned = new DirectoryScanner().Scan(fullPath);
+        ScannedDirectory renamed = new(displayName) { Size = scanned.Size, Error = scanned.Error };
+        renamed.Subdirectories.AddRange(scanned.Subdirectories);
+        renamed.Files.AddRange(scanned.Files);
+        return renamed;
+    }
+
+    /// <summary>
     /// Most files carry their own $DATA size; a file with either very many attributes or very many fragments can
     /// have NTFS move $DATA to a separate extension record instead, found through the base record's
     /// $ATTRIBUTE_LIST. The rare file whose own $ATTRIBUTE_LIST does not fit its record either falls back to an
     /// ordinary file-size query, since following that list would mean reading its own, possibly scattered, data runs.
     /// </summary>
-    static long ResolveFileSize(MftFileRecord record, string fullPath, Dictionary<long, long> extensionRecordDataSizes)
+    static long ResolveFileSize(MftFileRecord record, string fullPath, ConcurrentDictionary<long, long> extensionRecordDataSizes)
     {
         if (record.DataSizeFoundLocally)
             return record.DataSize;
@@ -178,8 +198,8 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
         return 0; // a genuinely empty file with no $DATA attribute at all, which NTFS allows
     }
 
-    /// <summary>Resolves the MFT record number backing an existing file or folder path.</summary>
-    static long ResolveRecordNumber(string path)
+    /// <summary>Resolves the MFT record number and volume serial number backing an existing file or folder path, following through any reparse point along the way exactly as Windows itself would.</summary>
+    static (long RecordNumber, long VolumeSerialNumber) ResolveRecordNumber(string path)
     {
         using SafeFileHandle handle = NativeStorageApi.CreateFile(path, NativeStorageApi.GenericRead, NativeStorageApi.FileShareReadWrite, 0, NativeStorageApi.OpenExisting, NativeStorageApi.FileFlagBackupSemantics, 0);
         if (handle.IsInvalid)
@@ -189,6 +209,8 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
         if (!NativeStorageApi.GetFileInformationByHandleEx(handle, FileIdInfoClass, fileIdInfo, (uint)fileIdInfo.Length))
             throw new IOException($"could not read the file ID of '{path}'", Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()));
 
-        return BitConverter.ToInt64(fileIdInfo, 8) & RecordNumberMask;
+        long volumeSerialNumber = BitConverter.ToInt64(fileIdInfo, 0);
+        long recordNumber = BitConverter.ToInt64(fileIdInfo, 8) & RecordNumberMask;
+        return (recordNumber, volumeSerialNumber);
     }
 }

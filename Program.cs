@@ -39,6 +39,14 @@ static class Program
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey(intercept: true);
         }
+        else if (!Directory.Exists(rootPath))
+        {
+            // A path arrives here only from the elevated restart in TryRestartElevatedForPath, so this should
+            // never actually be missing; check anyway rather than let a bad path fail confusingly deep in the scan.
+            Console.WriteLine($"'{rootPath}' is not a folder that exists. Press any key to exit...");
+            Console.ReadKey(intercept: true);
+            return;
+        }
 
         Console.Title = "Scanning";
         ScannedDirectory root = Scan(rootPath);
@@ -154,12 +162,9 @@ static class Program
 
         try
         {
-            using Process? elevated = Process.Start(new ProcessStartInfo(Environment.ProcessPath!)
-            {
-                Arguments = $"\"{rootPath}\"",
-                UseShellExecute = true,
-                Verb = "runas",
-            });
+            ProcessStartInfo startInfo = new(Environment.ProcessPath!) { UseShellExecute = true, Verb = "runas" };
+            startInfo.ArgumentList.Add(rootPath); // ArgumentList quotes correctly on its own — a hand-built "\"{path}\"" breaks for a path ending in \, which every drive root does
+            using Process? elevated = Process.Start(startInfo);
             return elevated is not null;
         }
         catch (Win32Exception)
