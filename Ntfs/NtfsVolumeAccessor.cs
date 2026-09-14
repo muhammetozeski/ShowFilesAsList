@@ -18,9 +18,11 @@ static class NtfsVolumeAccessor
     const int BytesPerFileRecordSegmentOffset = 48;
     const int MftStartLcnOffset = 64;
 
+    /// <param name="driveLetter">The volume to read, for example 'C'.</param>
+    /// <param name="progress">Reports the read phase: the total once known, then the bytes of each data run as it is read.</param>
     /// <exception cref="UnauthorizedAccessException">The current process cannot open the volume for raw reading (not elevated).</exception>
     /// <exception cref="IOException">The volume could not be queried or read.</exception>
-    public static NtfsMasterFileTable ReadMasterFileTable(char driveLetter)
+    public static NtfsMasterFileTable ReadMasterFileTable(char driveLetter, ScanProgress? progress = null)
     {
         using Microsoft.Win32.SafeHandles.SafeFileHandle volumeHandle = NativeStorageApi.CreateFile(
             $@"\\.\{driveLetter}:", NativeStorageApi.GenericRead, NativeStorageApi.FileShareReadWrite, 0, NativeStorageApi.OpenExisting, 0, 0);
@@ -50,10 +52,13 @@ static class NtfsVolumeAccessor
 
         long totalMftBytes = (mftDataRuns[^1].StartVcn + mftDataRuns[^1].ClusterCount) * bytesPerCluster;
         byte[] mft = new byte[totalMftBytes];
+        progress?.BeginPhase(ScanPhaseKind.ByteBar, "Reading the Master File Table", totalMftBytes);
         foreach (NtfsDataRun run in mftDataRuns)
         {
+            long runBytes = run.ClusterCount * bytesPerCluster;
             volumeStream.Seek(run.StartLcn * bytesPerCluster, SeekOrigin.Begin);
-            volumeStream.ReadExactly(mft, (int)(run.StartVcn * bytesPerCluster), (int)(run.ClusterCount * bytesPerCluster));
+            volumeStream.ReadExactly(mft, (int)(run.StartVcn * bytesPerCluster), (int)runBytes);
+            progress?.AdvanceBar(runBytes);
         }
 
         return new NtfsMasterFileTable(mft, bytesPerFileRecordSegment, bytesPerSector);

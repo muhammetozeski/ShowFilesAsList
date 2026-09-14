@@ -6,11 +6,12 @@ namespace ShowFilesAsList.Ntfs;
 
 using ShowFilesAsList; // ScannedDirectory: the result type this and DirectoryScanner both build
 
-/// <summary>Everything a whole scan's <see cref="MftVolumeScanner.BuildTree"/> calls share, bundled so passing it down through the recursion is one parameter, not three.</summary>
+/// <summary>Everything a whole scan's <see cref="MftVolumeScanner.BuildTree"/> calls share, bundled so passing it down through the recursion is one parameter, not four.</summary>
 sealed record MftScanContext(
     ConcurrentDictionary<long, MftFileRecord> RecordsByNumber,
     Dictionary<long, List<(MftFileRecord Record, string Name)>> ChildrenByParent,
-    ConcurrentDictionary<long, long> ExtensionRecordDataSizes);
+    ConcurrentDictionary<long, long> ExtensionRecordDataSizes,
+    ScanProgress? Progress);
 
 /// <summary>
 /// Scans a folder tree by reading the whole NTFS Master File Table once instead of opening every folder in it:
@@ -18,8 +19,8 @@ sealed record MftScanContext(
 /// Requires administrator rights and a local NTFS volume; <see cref="Program"/> falls back to
 /// <see cref="DirectoryScanner"/> when either is not the case.
 /// </summary>
-/// <param name="reportProgress">Receives the total size in bytes of the scanned files once the tree is built.</param>
-sealed class MftVolumeScanner(Action<long>? reportProgress = null)
+/// <param name="progress">Reports the phases (reading, parsing, indexing, tree building) as they run; may be <see langword="null"/>.</param>
+sealed class MftVolumeScanner(ScanProgress? progress = null)
 {
     const int FileIdInfoClass = 18;
     const int FileIdInfoBufferSize = 24; // VolumeSerialNumber (8 bytes) + FILE_ID_128 (16 bytes)
@@ -30,17 +31,15 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
     public ScannedDirectory Scan(string rootPath)
     {
         char driveLetter = char.ToUpperInvariant(Path.GetPathRoot(rootPath) is { Length: > 0 } rootPrefix ? rootPrefix[0] : throw new IOException($"'{rootPath}' has no drive letter"));
-        NtfsMasterFileTable masterFileTable = NtfsVolumeAccessor.ReadMasterFileTable(driveLetter);
+        NtfsMasterFileTable masterFileTable = NtfsVolumeAccessor.ReadMasterFileTable(driveLetter, progress);
 
-        (ConcurrentDictionary<long, MftFileRecord> recordsByNumber, ConcurrentDictionary<long, long> extensionRecordDataSizes) = ParseAllRecords(masterFileTable);
-        Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent = BuildChildIndex(recordsByNumber);
+        (ConcurrentDictionary<long, MftFileRecord> recordsByNumber, ConcurrentDictionary<long, long> extensionRecordDataSizes) = ParseAllRecords(masterFileTable, progress);
+        Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent = BuildChildIndex(recordsByNumber, progress);
 
         long rootRecordNumber = ResolveRecordNumber(rootPath);
-        MftScanContext context = new(recordsByNumber, childrenByParent, extensionRecordDataSizes);
-        ScannedDirectory rootDirectory = BuildTree(rootRecordNumber, rootPath, rootPath, context, [rootRecordNumber]);
-
-        reportProgress?.Invoke(rootDirectory.Size);
-        return rootDirectory;
+        progress?.BeginPhase(ScanPhaseKind.TreeCounts, "Building the folder tree");
+        MftScanContext context = new(recordsByNumber, childrenByParent, extensionRecordDataSizes, progress);
+        return BuildTree(rootRecordNumber, rootPath, rootPath, context, [rootRecordNumber]);
     }
 
     /// <summary>
@@ -52,38 +51,46 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
     /// nothing downstream writes to them again, so copying them into plain Dictionaries first would only add an
     /// extra full pass over every entry for no benefit.
     /// </summary>
-    static (ConcurrentDictionary<long, MftFileRecord> RecordsByNumber, ConcurrentDictionary<long, long> ExtensionRecordDataSizes) ParseAllRecords(NtfsMasterFileTable masterFileTable)
+    static (ConcurrentDictionary<long, MftFileRecord> RecordsByNumber, ConcurrentDictionary<long, long> ExtensionRecordDataSizes) ParseAllRecords(NtfsMasterFileTable masterFileTable, ScanProgress? progress)
     {
         int recordLength = masterFileTable.BytesPerFileRecordSegment;
         int recordCount = masterFileTable.Bytes.Length / recordLength;
         ConcurrentDictionary<long, MftFileRecord> records = new();
         ConcurrentDictionary<long, long> extensionRecordDataSizes = new();
 
-        Parallel.For(0, recordCount, recordNumber =>
+        // Partitioning into contiguous ranges (rather than Parallel.For over each index) means one plain inner loop
+        // per range and a single progress update when the range finishes — so the shared progress counter is touched
+        // a few dozen times across the whole parse instead of over a million, never becoming a point of contention.
+        progress?.BeginPhase(ScanPhaseKind.CountBar, "Parsing file records", recordCount);
+        Parallel.ForEach(Partitioner.Create(0, recordCount), range =>
         {
-            int recordOffset = recordNumber * recordLength;
-            if (!MftRecordParser.HasFileSignature(masterFileTable.Bytes, recordOffset))
-                return;
-            if (!MftRecordParser.ApplyFixup(masterFileTable.Bytes, recordOffset, recordLength, masterFileTable.BytesPerSector))
-                return; // the update sequence check failed; treat as unreadable rather than trust a half-fixed-up record
-
-            if (MftRecordParser.Parse(masterFileTable.Bytes, recordOffset, recordLength, recordNumber) is { } record)
+            for (int recordNumber = range.Item1; recordNumber < range.Item2; recordNumber++)
             {
-                records[recordNumber] = record;
-                return;
-            }
+                int recordOffset = recordNumber * recordLength;
+                if (!MftRecordParser.HasFileSignature(masterFileTable.Bytes, recordOffset))
+                    continue;
+                if (!MftRecordParser.ApplyFixup(masterFileTable.Bytes, recordOffset, recordLength, masterFileTable.BytesPerSector))
+                    continue; // the update sequence check failed; treat as unreadable rather than trust a half-fixed-up record
 
-            if (MftRecordParser.TryGetExtensionRecordDataSize(masterFileTable.Bytes, recordOffset, recordLength) is { } extensionDataSize)
-                extensionRecordDataSizes[recordNumber] = extensionDataSize;
+                if (MftRecordParser.Parse(masterFileTable.Bytes, recordOffset, recordLength, recordNumber) is { } record)
+                    records[recordNumber] = record;
+                else if (MftRecordParser.TryGetExtensionRecordDataSize(masterFileTable.Bytes, recordOffset, recordLength) is { } extensionDataSize)
+                    extensionRecordDataSizes[recordNumber] = extensionDataSize;
+            }
+            progress?.AdvanceBar(range.Item2 - range.Item1);
         });
 
         return (records, extensionRecordDataSizes);
     }
 
+    const int IndexProgressBatch = 8192;
+
     /// <summary>Inverts the record set into a parent record number to (child, name) lookup, ready for a top-down tree walk.</summary>
-    static Dictionary<long, List<(MftFileRecord Record, string Name)>> BuildChildIndex(ConcurrentDictionary<long, MftFileRecord> recordsByNumber)
+    static Dictionary<long, List<(MftFileRecord Record, string Name)>> BuildChildIndex(ConcurrentDictionary<long, MftFileRecord> recordsByNumber, ScanProgress? progress)
     {
+        progress?.BeginPhase(ScanPhaseKind.CountBar, "Building the record index", recordsByNumber.Count);
         Dictionary<long, List<(MftFileRecord Record, string Name)>> childrenByParent = new(recordsByNumber.Count);
+        long sinceReport = 0;
         foreach (MftFileRecord record in recordsByNumber.Values)
         {
             foreach ((long parentRecordNumber, string name) in record.DistinctParentNames())
@@ -97,7 +104,14 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
                     childrenByParent[parentRecordNumber] = children = [];
                 children.Add((record, name));
             }
+
+            if (++sinceReport >= IndexProgressBatch)
+            {
+                progress?.AdvanceBar(sinceReport);
+                sinceReport = 0;
+            }
         }
+        progress?.AdvanceBar(sinceReport);
         return childrenByParent;
     }
 
@@ -153,6 +167,8 @@ sealed class MftVolumeScanner(Action<long>? reportProgress = null)
                 directory.Size += fileSize;
             }
         }
+
+        context.Progress?.AddTreeCounts(directory.Files.Count, directory.Junctions.Count);
         return directory;
     }
 

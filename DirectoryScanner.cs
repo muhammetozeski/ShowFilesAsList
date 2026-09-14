@@ -10,24 +10,18 @@ namespace ShowFilesAsList;
 /// spinning hard drive, where concurrent reads from scattered folders add seeks instead of hiding them. A solid-state
 /// drive has no seek cost and benefits from a much higher value, since it can service many requests at once.
 /// </param>
-/// <param name="reportProgress">
-/// Receives the total size in bytes of the files counted so far: at most once every
-/// <see cref="ProgressIntervalMilliseconds"/> milliseconds during a scan, and once more with the final total.
+/// <param name="progress">
+/// Receives one publish per folder — that folder's file and junction counts, its file bytes and its path — never a
+/// publish per file, so the shared counters are never touched at file frequency. May be <see langword="null"/>.
 /// </param>
-sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, Action<long>? reportProgress = null)
+sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, ScanProgress? progress = null)
 {
-    const int ProgressIntervalMilliseconds = 100;
-
     // The same entries DirectoryInfo.GetFiles() and GetDirectories() return: hidden and system entries are included,
     // and a folder that cannot be opened throws instead of being skipped without a trace.
     static readonly EnumerationOptions AllEntries = new() { AttributesToSkip = 0, IgnoreInaccessible = false };
 
     // One slot is this thread itself, so a parallelism of 1 hands out no extra slots and the walk stays sequential.
     readonly SemaphoreSlim? extraWorkerSlots = maxDegreeOfParallelism > 1 ? new SemaphoreSlim(maxDegreeOfParallelism - 1) : null;
-    readonly Lock progressLock = new();
-
-    long scannedBytes;
-    long nextProgressTime;
 
     /// <summary>
     /// Scans <paramref name="rootPath"/> and every folder below it, reading each folder once.
@@ -37,12 +31,8 @@ sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, Action<long>? repo
     /// <returns>The scanned root folder.</returns>
     public ScannedDirectory Scan(string rootPath)
     {
-        scannedBytes = 0;
-        nextProgressTime = 0;
-
-        ScannedDirectory root = ScanDirectory(rootPath, rootPath);
-        reportProgress?.Invoke(Interlocked.Read(ref scannedBytes));
-        return root;
+        progress?.BeginPhase(ScanPhaseKind.Walk, "Scanning folders");
+        return ScanDirectory(rootPath, rootPath);
     }
 
     /// <summary>
@@ -55,6 +45,7 @@ sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, Action<long>? repo
     ScannedDirectory ScanDirectory(string path, string name)
     {
         ScannedDirectory directory = new(name);
+        long ownFileBytes = 0;
 
         try
         {
@@ -96,7 +87,7 @@ sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, Action<long>? repo
                 {
                     directory.Files.Add((entryName, length));
                     directory.Size += length;
-                    Interlocked.Add(ref scannedBytes, length);
+                    ownFileBytes += length;
                 }
             }
 
@@ -115,21 +106,7 @@ sealed class DirectoryScanner(int maxDegreeOfParallelism = 1, Action<long>? repo
             directory.Error = (exception.Message, path);
         }
 
-        ReportProgressIfDue();
+        progress?.PublishWalk(directory.Files.Count, directory.Junctions.Count, ownFileBytes, path);
         return directory;
-    }
-
-    void ReportProgressIfDue()
-    {
-        if (reportProgress is null)
-            return;
-
-        lock (progressLock)
-        {
-            if (Environment.TickCount64 < nextProgressTime)
-                return;
-            reportProgress(Interlocked.Read(ref scannedBytes));
-            nextProgressTime = Environment.TickCount64 + ProgressIntervalMilliseconds;
-        }
     }
 }

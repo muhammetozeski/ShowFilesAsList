@@ -9,7 +9,6 @@ static class Program
 {
     const string ResultFileName = "result.json";
     const string FolderPrompt = "Please enter a folder to scan:";
-    const int ProgressLineWidth = 24;
 
     // Parallelism used for the classic, per-folder scan when the fast NTFS path is not available. A solid-state
     // drive has no seek cost and services many requests at once; a spinning drive is fastest read one folder at a
@@ -49,18 +48,31 @@ static class Program
         }
 
         Console.Title = "Scanning";
-        Stopwatch scanStopwatch = Stopwatch.StartNew();
-        ScannedDirectory root = Scan(rootPath);
-        TimeSpan scanDuration = scanStopwatch.Elapsed;
-        Console.WriteLine();
+        ScanProgress progress = new();
+        ProgressDisplay display = new(progress);
 
+        Stopwatch scanStopwatch = Stopwatch.StartNew();
+        ScannedDirectory root = Scan(rootPath, progress);
+        TimeSpan scanDuration = scanStopwatch.Elapsed; // the scan only; the write below is timed and reported separately
+
+        // The final tree's own counters, read before the write phase's BeginPhase resets them, are the write bar's total.
+        long totalEntries = progress.Folders + progress.Files + progress.Junctions;
+        string? saveError = null;
         try
         {
-            ResultJsonWriter.Write(resultFilePath, rootPath, root, scanDuration);
+            progress.BeginPhase(ScanPhaseKind.EntryBar, "Writing result.json", totalEntries);
+            ResultJsonWriter.Write(resultFilePath, rootPath, root, scanDuration, progress);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            Console.WriteLine($"Could not save {resultFilePath}: {exception.Message}");
+            saveError = exception.Message;
+        }
+        progress.Complete();
+        display.Dispose();
+
+        if (saveError is not null)
+        {
+            Console.WriteLine($"Could not save {resultFilePath}: {saveError}");
             Console.WriteLine("Press any key to exit...");
             Console.ReadKey(intercept: true);
             return;
@@ -97,29 +109,27 @@ static class Program
     /// every folder one by one — and otherwise the ordinary per-folder walk. On a local NTFS drive without
     /// elevation, offers to restart elevated so the fast reader can be used.
     /// </summary>
-    static ScannedDirectory Scan(string rootPath)
+    static ScannedDirectory Scan(string rootPath, ScanProgress progress)
     {
-        void ReportProgress(long scannedBytes) => Console.Write($"\r{scannedBytes.ToSizeText()} read".PadRight(ProgressLineWidth));
-
         if (!IsLocalNtfsDrive(rootPath))
-            return new DirectoryScanner(ParallelismFor(rootPath), ReportProgress).Scan(rootPath);
+            return new DirectoryScanner(ParallelismFor(rootPath), progress).Scan(rootPath);
 
         if (!IsRunningElevated())
         {
             if (TryRestartElevatedForPath(rootPath))
                 Environment.Exit(0);
             Console.WriteLine("Continuing without administrator rights: this scan will use the ordinary, slower folder walk.");
-            return new DirectoryScanner(ParallelismFor(rootPath), ReportProgress).Scan(rootPath);
+            return new DirectoryScanner(ParallelismFor(rootPath), progress).Scan(rootPath);
         }
 
         try
         {
-            return new MftVolumeScanner(ReportProgress).Scan(rootPath);
+            return new MftVolumeScanner(progress).Scan(rootPath);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             Console.WriteLine($"The fast NTFS scan could not be used ({exception.Message}); falling back to the ordinary folder walk.");
-            return new DirectoryScanner(ParallelismFor(rootPath), ReportProgress).Scan(rootPath);
+            return new DirectoryScanner(ParallelismFor(rootPath), progress).Scan(rootPath);
         }
     }
 

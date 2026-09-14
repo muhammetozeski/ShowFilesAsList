@@ -67,7 +67,11 @@ same sizes, the same tree — so which one ran does not change what ends up in `
   never opened: its target is often reachable under its own, real location elsewhere in the tree too, so counting
   its content here as well would count it twice.
 - The notes at the top show how long the scan took, the scanned size, and the free and total space of the drive.
-- A progress line shows how much has been counted while the scan runs.
+- A live progress display shows each stage as it runs — reading the Master File Table, parsing records, building
+  the tree, writing the file — with a bar and a percentage where the total is known, and the running folder and
+  file counts otherwise. It is drawn on its own thread that only reads counters the scan leaves in memory, so it
+  adds nothing measurable to the scan time; when the output is redirected to a file it prints one line per finished
+  stage instead of a live bar.
 - Quotes around the entered path are removed, so a path copied with Explorer's **Copy as path** can be pasted as it is.
 - Falling back to the ordinary walk (declined elevation, a non-NTFS drive, network path or removable media) still
   scans several folders at once on a solid-state drive; a spinning hard drive is scanned one folder at a time, since
@@ -139,8 +143,10 @@ dotnet publish -c Release -r win-x64 -p:IlcUseEnvironmentalTools=true -o publish
 | `StorageMediaDetector.cs` | Finds whether a path's drive is solid-state or spinning, to size `DirectoryScanner`'s parallelism |
 | `NativeStorageApi.cs` | The raw `CreateFile` / `DeviceIoControl` calls `StorageMediaDetector` and the NTFS reader share |
 | `ScannedDirectory.cs` | One scanned folder: files, subfolders, junctions, total size and read error — the shared result of either scan strategy |
+| `ScanProgress.cs` | The live counters the scan threads update and the display reads — the one channel between them |
+| `ProgressDisplay.cs` | The background thread that draws the progress bars and the finished-stage lines |
 | `ResultJsonWriter.cs` | Writes the notes and the tree to the JSON file |
-| `SizeTextExtensions.cs` | Turns byte counts into text such as `512 B` or `1.50 GB` |
+| `SizeTextExtensions.cs` | Turns byte counts into text such as `512 B` or `1.50 GB`, and durations into `934 ms` or `6.27 s` |
 | `Ntfs/MftVolumeScanner.cs` | The fast path: builds the same tree as `DirectoryScanner` from one read of the volume's Master File Table |
 | `Ntfs/NtfsVolumeAccessor.cs` | Opens an NTFS volume and reads its whole Master File Table in a few large sequential reads |
 | `Ntfs/MftRecordParser.cs` | Parses one MFT record: the update sequence fixup, its attributes, its name and size |

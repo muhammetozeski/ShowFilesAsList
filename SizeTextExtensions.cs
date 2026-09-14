@@ -1,7 +1,7 @@
 namespace ShowFilesAsList;
 
 /// <summary>
-/// Turns byte counts into the size text written to result.json and to the progress line.
+/// Formats byte counts and durations the way result.json and the progress display show them.
 /// </summary>
 static class SizeTextExtensions
 {
@@ -29,5 +29,17 @@ static class SizeTextExtensions
 
             return unitIndex == 0 ? $"{byteCount} {Units[0]}" : $"{size:F2} {Units[unitIndex]}";
         }
+    }
+
+    /// <param name="duration">An elapsed time.</param>
+    extension(TimeSpan duration)
+    {
+        /// <summary>Milliseconds under a second, seconds with two decimals under a minute, whole minutes and seconds beyond that.</summary>
+        public string ToDurationText() => duration.TotalSeconds switch
+        {
+            < 1 => $"{duration.TotalMilliseconds:F0} ms",
+            < 60 => $"{duration.TotalSeconds:F2} s",
+            _ => $"{(int)duration.TotalMinutes} m {duration.Seconds} s",
+        };
     }
 }

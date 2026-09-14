@@ -28,28 +28,18 @@ static class ResultJsonWriter
     /// <param name="rootPath">Full path of the scanned folder, used to look up the disk space of its drive.</param>
     /// <param name="root">The scanned folder whose content becomes the root JSON object.</param>
     /// <param name="scanDuration">How long the scan itself took, from start to the finished tree — not reading the folder path, not writing this file.</param>
+    /// <param name="progress">Advances the write-phase bar as folders are written; may be <see langword="null"/>.</param>
     /// <exception cref="IOException">The file could not be created or written.</exception>
     /// <exception cref="UnauthorizedAccessException">Writing to <paramref name="filePath"/> is not permitted.</exception>
-    public static void Write(string filePath, string rootPath, ScannedDirectory root, TimeSpan scanDuration)
+    public static void Write(string filePath, string rootPath, ScannedDirectory root, TimeSpan scanDuration, ScanProgress? progress = null)
     {
         using FileStream file = File.Create(filePath);
         using Utf8JsonWriter writer = new(file, WriterOptions);
 
         writer.WriteStartObject();
         writer.WriteString(NotesKey, CreateNotes(rootPath, root.Size, scanDuration));
-        WriteContent(writer, root);
+        WriteContent(writer, root, progress);
         writer.WriteEndObject();
-    }
-
-    extension(TimeSpan duration)
-    {
-        /// <summary>Formats a scan duration as milliseconds under a second, seconds with two decimals under a minute, or whole minutes and seconds beyond that.</summary>
-        string ToScanTimeText() => duration.TotalSeconds switch
-        {
-            < 1 => $"{duration.TotalMilliseconds:F0} ms",
-            < 60 => $"{duration.TotalSeconds:F2} s",
-            _ => $"{(int)duration.TotalMinutes} m {duration.Seconds} s",
-        };
     }
 
     /// <summary>
@@ -64,7 +54,7 @@ static class ResultJsonWriter
     /// </returns>
     static string CreateNotes(string rootPath, long scannedBytes, TimeSpan scanDuration)
     {
-        string scanTimeLine = $"Scan time: {scanDuration.ToScanTimeText()}";
+        string scanTimeLine = $"Scan time: {scanDuration.ToDurationText()}";
         string scannedSizeLine = $"Scanned size: {scannedBytes.ToSizeText()}";
 
         try
@@ -83,12 +73,13 @@ static class ResultJsonWriter
     /// </summary>
     /// <param name="writer">A writer whose innermost open object belongs to <paramref name="directory"/>.</param>
     /// <param name="directory">The folder whose content is written.</param>
-    static void WriteContent(Utf8JsonWriter writer, ScannedDirectory directory)
+    /// <param name="progress">Advanced once per folder written (by this folder's own entry count), so the write-phase bar fills without a per-entry update.</param>
+    static void WriteContent(Utf8JsonWriter writer, ScannedDirectory directory, ScanProgress? progress)
     {
         foreach (ScannedDirectory subdirectory in directory.Subdirectories.OrderByDescending(static subdirectory => subdirectory.Size))
         {
             writer.WriteStartObject($"{subdirectory.Name}{FolderKeySeparator}{subdirectory.Size.ToSizeText()}");
-            WriteContent(writer, subdirectory);
+            WriteContent(writer, subdirectory, progress);
             writer.WriteEndObject();
         }
 
@@ -100,6 +91,8 @@ static class ResultJsonWriter
 
         if (directory.Error is (string message, string path))
             writer.WriteString($"{ErrorKeyPrefix}{message}", path);
+
+        progress?.AdvanceBar(1 + directory.Files.Count + directory.Junctions.Count);
 
         // Utf8JsonWriter keeps the written JSON in memory until Flush, which would hold the whole file for a large tree.
         if (writer.BytesPending >= FlushThresholdBytes)
